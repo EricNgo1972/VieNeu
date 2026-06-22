@@ -56,18 +56,8 @@ is accepted but ignored). Pick it with `VIENEU_MODE`:
 
 ### GPU build (matches tts.starb.ca speed)
 
-On an NVIDIA host with the driver + [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit):
-
-```bash
-docker compose -f docker-compose.gpu.yml up -d --build      # VIENEU_MODE=v3turbo by default
-# or plain docker:
-docker build -f Dockerfile.gpu -t vieneu-openai-shim:gpu .
-docker run -d --gpus all -p 8080:8080 -v vieneu_hf:/data/hf \
-  -e VIENEU_MODE=v3turbo vieneu-openai-shim:gpu
-```
-
-The GPU image installs `vieneu[gpu]` (PyTorch CUDA 12.8 + transformers/lmdeploy), so it's
-large and **must be built/tested on the GPU host** (it can't be validated on a CPU-only box).
+For the full walkthrough — prerequisites, build, verifying the GPU is used, and exposing it
+— see **[Deploy to a GPU server](#deploy-to-a-gpu-server)** below.
 
 ### Remote mode
 
@@ -75,7 +65,90 @@ large and **must be built/tested on the GPU host** (it can't be validated on a C
 (`VIENEU_API_BASE`, e.g. `http://gpu-host:23333/v1`) and decodes the codec locally. Note the
 codec decode still runs on the shim's CPU, so for top speed prefer the GPU image above.
 
-## Run
+## Deploy to a GPU server
+
+Run the **GPU image** (`Dockerfile.gpu`) on an NVIDIA host to match `tts.starb.ca` speed —
+the SDK auto-switches to the PyTorch CUDA engine. The image installs `vieneu[gpu]` (PyTorch
+CUDA 12.8 + transformers/lmdeploy), so it's large and **must be built on the GPU host**.
+
+### 1. Prerequisites on the host
+
+- An NVIDIA GPU with a recent driver — `nvidia-smi` must work on the host.
+- Docker Engine + Docker Compose.
+- The **NVIDIA Container Toolkit** (lets containers see the GPU):
+
+  ```bash
+  # Ubuntu/Debian
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+  sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+  ```
+
+- Verify Docker can see the GPU:
+
+  ```bash
+  docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
+  ```
+
+### 2. Get the code on the GPU host
+
+```bash
+git clone https://github.com/EricNgo1972/VieNeu.git vieneu-tts-shim
+cd vieneu-tts-shim
+```
+
+### 3. Build & run
+
+```bash
+# Compose (recommended) — already requests all GPUs:
+docker compose -f docker-compose.gpu.yml up -d --build
+docker compose -f docker-compose.gpu.yml logs -f      # watch the first model download
+
+# …or plain docker:
+docker build -f Dockerfile.gpu -t vieneu-openai-shim:gpu .
+docker run -d --name vieneu-tts-shim --gpus all -p 8080:8080 \
+  -v vieneu_hf:/data/hf -e VIENEU_MODE=v3turbo --restart unless-stopped \
+  vieneu-openai-shim:gpu
+```
+
+Pick the model with `VIENEU_MODE` (`v3turbo` default, `fast`/`gpu` for v2, `standard` for v1
+— see the [Models table](#models--one-per-instance-chosen-by-vieneu_mode)). The first start
+downloads weights into the `hf-cache` volume; later restarts are fast.
+
+### 4. Confirm it's actually on the GPU
+
+```bash
+curl -s http://localhost:8080/health     # engine should be the GPU engine, not "onnx"
+nvidia-smi                               # the python process should appear on the GPU
+# time a synth — expect ~1–2 s, not the ~20 s CPU path
+time curl -s http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Xin chào từ GPU.","voice":"","response_format":"mp3"}' -o gpu.mp3
+```
+
+On a CUDA host v3 Turbo loads the **PyTorch** engine (startup log:
+`✅ VieNeu-TTS v3 Turbo ready (backend=pytorch)`) instead of `backend=onnx`.
+
+### 5. Expose it (so Maple Video Studio can reach it)
+
+Studio talks to the shim over HTTP at `:8080`. On a server, put it behind whatever you
+already use:
+
+- **Cloudflare tunnel** (same as `tts.starb.ca`): point a tunnel hostname at
+  `http://localhost:8080`, and set `SHIM_API_KEY` since it's now public.
+- **Reverse proxy** (nginx/Caddy/Traefik): proxy your TTS hostname → `127.0.0.1:8080`.
+- **Private network only:** reach it directly at `http://<gpu-host-ip>:8080`.
+
+Then point Studio at that URL — see [Point Maple Video Studio at it](#point-maple-video-studio-at-it).
+
+> **Port tip:** the shim and the Studio container both default to `8080`. On the same host,
+> remap one (e.g. `-p 8081:8080` for the shim). Behind separate tunnels/hosts there's no conflict.
+
+## Run (CPU / no GPU)
 
 ### Docker Compose (recommended)
 
@@ -127,17 +200,17 @@ Or pin the image in `docker-compose.yml` (replace `build: .` with
 
 | Var                   | Default                        | Notes                                        |
 |-----------------------|--------------------------------|----------------------------------------------|
-| `VIENEU_MODE`         | `local`                        | `local` or `remote`                          |
+| `VIENEU_MODE`         | `local`                        | model/engine — `local`·`v3turbo`·`fast`·`gpu`·`standard`·`remote` (see Models table) |
 | `VIENEU_EMOTION`      | `natural`                      | `natural` or `storytelling`                  |
-| `VIENEU_MODEL`        | `pnnbao-ump/VieNeu-TTS-v2`     | remote model id (remote mode)                |
+| `VIENEU_MODEL`        | *(empty)*                      | override model id; mainly for `remote` mode  |
 | `VIENEU_API_BASE`     | `http://localhost:23333/v1`    | remote LMDeploy base URL (remote mode)       |
 | `VIENEU_DEFAULT_VOICE`| *(empty)*                      | preset id used when a request omits `voice`  |
 | `SHIM_API_KEY`        | *(empty)*                      | if set, requires `Authorization: Bearer <key>` |
 | `HF_TOKEN`            | *(empty)*                      | only for private/gated HF models             |
 
-> **GPU note:** `local` mode is CPU/ONNX and torch-free by design. The v1/v2 GPU
-> models require VieNeu's PyTorch stack — for those, run VieNeu's own GPU server
-> and use this shim in **`remote`** mode (codec decode stays light/CPU).
+> **GPU note:** `local` is CPU/ONNX, torch-free, and serves only v3 Turbo. The GPU-backed
+> engines (`v3turbo`/`fast`/`gpu`/`standard`) need the GPU image (`Dockerfile.gpu`) — see
+> [Deploy to a GPU server](#deploy-to-a-gpu-server).
 
 ## Smoke test
 
