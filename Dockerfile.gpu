@@ -32,9 +32,10 @@ RUN apt-get update \
 #     unavailable for this CUDA, the build still succeeds (v2 just won't be available).
 # (llama-cpp-python / the v1 "standard" GGUF backend is intentionally omitted — it compiles
 #  from source and isn't needed; add it yourself if you want VIENEU_MODE=standard.)
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
-RUN python -m pip install --upgrade pip \
- && python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+# Note: don't `pip install --upgrade pip` here — the apt-provided pip has no RECORD file
+# and self-upgrade fails ("Cannot uninstall pip 24.0"). 24.0 installs the wheels fine.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
+RUN python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
       torch==2.8.0 torchaudio==2.8.0
 RUN python -m pip install \
       "vieneu==3.0.5" transformers "librosa>=0.11.0" "neucodec>=0.0.4" triton \
