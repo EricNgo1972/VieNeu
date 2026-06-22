@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+outputs/
+.venv/
+*.wav
+*.mp3
+hf-cache/

@@ -1,0 +1,8 @@
+.git
+__pycache__/
+*.pyc
+outputs/
+.venv/
+*.wav
+*.mp3
+README.md

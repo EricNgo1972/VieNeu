@@ -1,0 +1,7 @@
+# Torch-free: v3 Turbo runs on CPU via ONNX Runtime (no GPU needed).
+# `vieneu` pulls onnxruntime, soundfile, numpy, sea-g2p, huggingface_hub, gradio, etc.
+vieneu==3.0.5
+fastapi>=0.110
+uvicorn[standard]>=0.27
+soundfile>=0.12.1
+numpy

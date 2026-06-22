@@ -1,0 +1,26 @@
+services:
+  vieneu-shim:
+    build: .
+    image: vieneu-openai-shim
+    container_name: vieneu-tts-shim
+    ports:
+      - "8000:8000"
+    environment:
+      # ── Local mode (default): v3 Turbo on CPU/ONNX, self-contained, no GPU ──
+      VIENEU_MODE: local
+      VIENEU_EMOTION: natural          # natural | storytelling
+
+      # ── Remote mode: offload token gen to your VieNeu LMDeploy server ──────
+      # VIENEU_MODE: remote
+      # VIENEU_API_BASE: "http://YOUR-GPU-HOST:23333/v1"
+      # VIENEU_MODEL: "pnnbao-ump/VieNeu-TTS-v2"
+
+      # Optional: require this bearer token (set the SAME value as the app's TTS API key).
+      # SHIM_API_KEY: "change-me"
+      # HF_TOKEN: ""                    # only for private/gated models
+    volumes:
+      - hf-cache:/data/hf
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
