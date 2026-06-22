@@ -1,0 +1,30 @@
+# GPU deployment — run on an NVIDIA host with nvidia-container-toolkit installed.
+#   docker compose -f docker-compose.gpu.yml up -d --build
+services:
+  vieneu-shim-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: vieneu-openai-shim:gpu
+    container_name: vieneu-tts-shim-gpu
+    ports:
+      - "8080:8080"
+    environment:
+      VIENEU_MODE: v3turbo          # v3turbo | fast | gpu | standard | remote
+      VIENEU_EMOTION: natural       # natural | storytelling
+      # VIENEU_MODEL: ""            # only for remote mode
+      # SHIM_API_KEY: "change-me"
+      # HF_TOKEN: ""
+    volumes:
+      - hf-cache:/data/hf
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:

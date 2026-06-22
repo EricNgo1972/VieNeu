@@ -36,15 +36,44 @@ Studio app: it calls **Load voices**, lets you type Vietnamese text, synthesizes
 plays/downloads the result — so you can confirm the wrapper works (and audition voices)
 independently. If you set `SHIM_API_KEY`, paste it into the page's API-key field.
 
-## Modes
+## Models — one per instance, chosen by `VIENEU_MODE`
 
-Set with `VIENEU_MODE`:
+Each running instance serves **exactly one** model (the OpenAI `model` field in requests
+is accepted but ignored). Pick it with `VIENEU_MODE`:
 
-- **`local`** (default) — runs **v3 Turbo on CPU via ONNX** (torch-free, **no GPU**,
-  no dependency on any other server). Fully self-contained. Recommended.
-- **`remote`** — offloads token generation to your VieNeu **LMDeploy** server
-  (`VIENEU_API_BASE`, e.g. `http://gpu-host:23333/v1`) and decodes the codec
-  locally. Use this to drive the **v2 (GPU)** model.
+| `VIENEU_MODE`     | Model                         | Needs    | Image            |
+|-------------------|-------------------------------|----------|------------------|
+| `local` (default) | **v3 Turbo** (CPU via ONNX)   | nothing  | `Dockerfile`     |
+| `v3turbo`         | **v3 Turbo** (GPU, PyTorch)   | GPU      | `Dockerfile.gpu` |
+| `fast` / `gpu`    | **VieNeu-TTS-v2** (LMDeploy)  | GPU      | `Dockerfile.gpu` |
+| `standard`        | **VieNeu-TTS v1**             | GPU      | `Dockerfile.gpu` |
+| `remote`          | model on your `:23333` server | server   | either           |
+
+> **Why CPU is slow:** the minimal (torch-free) install only has **v3 Turbo on CPU/ONNX**
+> (~tens of seconds/sentence). `tts.starb.ca` runs on a **GPU**, which is far faster. To
+> match it, deploy the **GPU image** (`Dockerfile.gpu`) on an NVIDIA host — the SDK
+> auto-switches to the PyTorch CUDA engine. To serve **v2/v1** at all, you need the GPU image.
+
+### GPU build (matches tts.starb.ca speed)
+
+On an NVIDIA host with the driver + [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit):
+
+```bash
+docker compose -f docker-compose.gpu.yml up -d --build      # VIENEU_MODE=v3turbo by default
+# or plain docker:
+docker build -f Dockerfile.gpu -t vieneu-openai-shim:gpu .
+docker run -d --gpus all -p 8080:8080 -v vieneu_hf:/data/hf \
+  -e VIENEU_MODE=v3turbo vieneu-openai-shim:gpu
+```
+
+The GPU image installs `vieneu[gpu]` (PyTorch CUDA 12.8 + transformers/lmdeploy), so it's
+large and **must be built/tested on the GPU host** (it can't be validated on a CPU-only box).
+
+### Remote mode
+
+`VIENEU_MODE=remote` offloads token generation to your VieNeu **LMDeploy** server
+(`VIENEU_API_BASE`, e.g. `http://gpu-host:23333/v1`) and decodes the codec locally. Note the
+codec decode still runs on the shim's CPU, so for top speed prefer the GPU image above.
 
 ## Run
 

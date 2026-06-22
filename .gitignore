@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 outputs/
 .venv/
+.hf/
+hf-cache/
 *.wav
 *.mp3
-hf-cache/
+.agent_harnesses.json

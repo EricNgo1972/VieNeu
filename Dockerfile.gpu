@@ -1,0 +1,43 @@
+# VieNeu-TTS → OpenAI-compatible TTS shim — GPU build.
+# Installs the PyTorch (CUDA 12.8) stack so the SDK runs on the GPU — matching the
+# speed of the tts.starb.ca deployment. Run on an NVIDIA host with `--gpus all`
+# (requires the NVIDIA driver + nvidia-container-toolkit).
+#
+# Choose the model with VIENEU_MODE (default v3turbo, GPU auto-detected):
+#   v3turbo            v3 Turbo on GPU (PyTorch)         — what tts.starb.ca shows by default
+#   fast | gpu         VieNeu-TTS-v2 (GPU, LMDeploy)
+#   standard           VieNeu-TTS v1
+#   remote             offload to a :23333 LMDeploy server (then this image is overkill — use the CPU one)
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/data/hf \
+    VIENEU_MODE=v3turbo \
+    VIENEU_EMOTION=natural
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       python3.12 python3-pip libsndfile1 ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+# Torch + torchaudio come from PyTorch's CUDA 12.8 index; vieneu[gpu] pulls
+# transformers/lmdeploy/librosa. --break-system-packages: this is a dedicated container.
+RUN python -m pip install --break-system-packages --upgrade pip \
+ && python -m pip install --break-system-packages \
+      --extra-index-url https://download.pytorch.org/whl/cu128 \
+      "vieneu[gpu]==3.0.5" "fastapi>=0.110" "uvicorn[standard]>=0.27" "soundfile>=0.12.1" numpy
+
+COPY app.py .
+
+RUN mkdir -p /data/hf
+VOLUME ["/data/hf"]
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=10s --start-period=240s --retries=5 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

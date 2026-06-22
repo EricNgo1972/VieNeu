@@ -39,8 +39,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("vieneu-shim")
 
 # ── Config (all via env) ────────────────────────────────────────────────────
-MODE          = os.getenv("VIENEU_MODE", "local").strip().lower()
-MODEL_NAME    = os.getenv("VIENEU_MODEL", "pnnbao-ump/VieNeu-TTS-v2").strip()
+# VIENEU_MODE selects which model this instance serves (one model per instance).
+#   local            → v3turbo  (v3 Turbo; CPU=ONNX torch-free, GPU=PyTorch auto)  [minimal install]
+#   remote           → offload token-gen to a VieNeu :23333 LMDeploy server
+# These need `pip install vieneu[gpu]` (the GPU image): they map straight to the SDK mode —
+#   fast | gpu       → VieNeu-TTS-v2 (GPU, LMDeploy)
+#   turbo | turbo_gpu→ v3 Turbo (PyTorch)
+#   standard         → VieNeu-TTS v1
+#   xpu              → Intel GPU
+_RAW_MODE     = os.getenv("VIENEU_MODE", "local").strip().lower()
+SDK_MODE      = {"": "v3turbo", "local": "v3turbo"}.get(_RAW_MODE, _RAW_MODE)
+IS_REMOTE     = SDK_MODE in ("remote", "api")
+MODEL_NAME    = os.getenv("VIENEU_MODEL", "").strip()
+_MODEL_LABELS = {
+    "v3turbo": "VieNeu-TTS-v3-Turbo", "turbo": "VieNeu-TTS-v3-Turbo",
+    "turbo_gpu": "VieNeu-TTS-v3-Turbo (GPU)", "fast": "VieNeu-TTS-v2 (GPU)",
+    "gpu": "VieNeu-TTS-v2 (GPU)", "standard": "VieNeu-TTS-v1", "xpu": "VieNeu-TTS-v3-Turbo (XPU)",
+}
 API_BASE      = os.getenv("VIENEU_API_BASE", "http://localhost:23333/v1").strip()
 EMOTION       = os.getenv("VIENEU_EMOTION", "natural").strip()        # natural | storytelling
 DEFAULT_VOICE = os.getenv("VIENEU_DEFAULT_VOICE", "").strip()         # optional preset id
@@ -55,6 +70,14 @@ _FORMATS = {
     "ogg":  ("OGG", "audio/ogg"),
     "opus": ("OGG", "audio/ogg"),
 }
+
+def _active_model() -> str:
+    """The model this instance actually serves (one per instance), per VIENEU_MODE.
+    remote = whatever runs on the :23333 server (VIENEU_MODEL)."""
+    if IS_REMOTE:
+        return MODEL_NAME or "pnnbao-ump/VieNeu-TTS-v2"
+    return MODEL_NAME or _MODEL_LABELS.get(SDK_MODE, SDK_MODE)
+
 
 app = FastAPI(title="VieNeu-TTS OpenAI shim", version="1.0")
 
@@ -75,13 +98,11 @@ def _load():
         if _tts is not None:
             return _tts
         from vieneu import Vieneu  # imported here so /health works before models download
-        log.info("Loading VieNeu (mode=%s, model=%s, emotion=%s)…", MODE, MODEL_NAME, EMOTION)
-        if MODE == "remote":
-            _tts = Vieneu(mode="remote", api_base=API_BASE, model_name=MODEL_NAME,
-                          emotion=EMOTION, hf_token=HF_TOKEN)
-        else:
-            # Default v3 Turbo, CPU/ONNX, torch-free.
-            _tts = Vieneu(emotion=EMOTION, hf_token=HF_TOKEN)
+        log.info("Loading VieNeu (sdk_mode=%s, model=%s, emotion=%s)…", SDK_MODE, _active_model(), EMOTION)
+        kwargs = dict(emotion=EMOTION, hf_token=HF_TOKEN)
+        if IS_REMOTE:
+            kwargs.update(api_base=API_BASE, model_name=MODEL_NAME or "pnnbao-ump/VieNeu-TTS-v2")
+        _tts = Vieneu(mode=SDK_MODE, **kwargs)
         try:
             _voices = list(_tts.list_preset_voices() or [])
         except Exception as e:  # noqa: BLE001
@@ -156,7 +177,7 @@ class SpeechRequest(BaseModel):
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "mode": MODE, "model": MODEL_NAME,
+    return {"status": "ok", "mode": _RAW_MODE, "engine": SDK_MODE, "model": _active_model(),
             "loaded": _tts is not None, "voices": len(_voices)}
 
 
@@ -170,7 +191,7 @@ def test_ui():
 @app.get("/v1/models")
 def list_models(authorization: str | None = Header(default=None)):
     _check_auth(authorization)
-    return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "vieneu"}]}
+    return {"object": "list", "data": [{"id": _active_model(), "object": "model", "owned_by": "vieneu"}]}
 
 
 @app.get("/v1/audio/voices")
@@ -283,7 +304,7 @@ async function health() {
   try {
     const r = await fetch('health'); const j = await r.json();
     document.getElementById('badge').textContent =
-      j.mode + (j.loaded ? ' · loaded' : ' · not loaded') + ' · ' + j.voices + ' voices';
+      j.model + ' · ' + j.mode + (j.loaded ? ' · loaded' : ' · not loaded') + ' · ' + j.voices + ' voices';
   } catch { document.getElementById('badge').textContent = 'offline'; }
 }
 async function loadVoices() {
