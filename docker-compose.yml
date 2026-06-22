@@ -4,7 +4,7 @@ services:
     image: vieneu-openai-shim
     container_name: vieneu-tts-shim
     ports:
-      - "8000:8000"
+      - "8080:8080"
     environment:
       # ── Local mode (default): v3 Turbo on CPU/ONNX, self-contained, no GPU ──
       VIENEU_MODE: local

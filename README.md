@@ -53,7 +53,7 @@ docker compose logs -f
 
 ```bash
 docker build -t vieneu-openai-shim .
-docker run -d --name vieneu-tts-shim -p 8000:8000 \
+docker run -d --name vieneu-tts-shim -p 8080:8080 \
   -v vieneu_hf:/data/hf \
   -e VIENEU_MODE=local \
   vieneu-openai-shim
@@ -63,7 +63,7 @@ docker run -d --name vieneu-tts-shim -p 8000:8000 \
 
 ```bash
 pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
 ## Configuration (env vars)
@@ -86,10 +86,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 ```bash
 # voices
-curl -s http://localhost:8000/v1/audio/voices | python3 -m json.tool
+curl -s http://localhost:8080/v1/audio/voices | python3 -m json.tool
 
 # synthesize → out.mp3
-curl -s http://localhost:8000/v1/audio/speech \
+curl -s http://localhost:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"Xin chào, đây là giọng đọc tiếng Việt.","voice":"","response_format":"mp3"}' \
   -o out.mp3 && file out.mp3
@@ -100,7 +100,7 @@ curl -s http://localhost:8000/v1/audio/speech \
 In **Settings → Voiceover (TTS)**:
 
 - **Provider:** OpenAI
-- **Endpoint:** `http://<shim-host>:8000`  (the app appends `/v1/audio/speech`)
+- **Endpoint:** `http://<shim-host>:8080`  (the app appends `/v1/audio/speech`)
 - **API key:** leave blank, or the `SHIM_API_KEY` value if you set one
 - **Model:** any value (the shim is bound to one model) — e.g. `pnnbao-ump/VieNeu-TTS-v2`
 - **Default voice:** click **Load voices** to pull the real Vietnamese voice list
