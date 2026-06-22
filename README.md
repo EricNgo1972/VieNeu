@@ -74,6 +74,26 @@ pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
+## Build & publish the image (GitHub Actions → GHCR)
+
+A **manual** workflow (`.github/workflows/build.yml`) builds the container and pushes it to
+GitHub Container Registry. It does **not** run on push — trigger it yourself:
+
+1. GitHub → **Actions** → **build-and-push** → **Run workflow** (optionally pass an extra tag).
+2. It publishes `ghcr.io/ericngo1972/vieneu:latest` (lowercased automatically).
+
+Pull and run it on the host (the package is private, so log in first):
+
+```bash
+echo "$GHCR_PAT" | docker login ghcr.io -u EricNgo1972 --password-stdin   # PAT with read:packages
+docker run -d --name vieneu-tts-shim -p 8080:8080 \
+  -v vieneu_hf:/data/hf -e VIENEU_MODE=local \
+  ghcr.io/ericngo1972/vieneu:latest
+```
+
+Or pin the image in `docker-compose.yml` (replace `build: .` with
+`image: ghcr.io/ericngo1972/vieneu:latest`).
+
 ## Configuration (env vars)
 
 | Var                   | Default                        | Notes                                        |
