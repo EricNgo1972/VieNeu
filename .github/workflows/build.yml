@@ -1,15 +1,17 @@
 name: build-and-push
 
-# Builds the VieNeu-TTS shim container and pushes it to GitHub Container Registry (GHCR).
-# Manual only: run it from the Actions tab (Run workflow) when you want a new image.
-# Publishes ghcr.io/<owner>/<repo>:latest (+ an optional custom tag you pass in).
+# Builds the VieNeu-TTS shim container(s) and pushes to GitHub Container Registry (GHCR).
+# Manual only: run from the Actions tab (Run workflow). Builds two variants in parallel:
+#   ghcr.io/<owner>/<repo>:latest , :cpu   ← CPU image (v3 Turbo on ONNX, torch-free)
+#   ghcr.io/<owner>/<repo>:gpu             ← GPU image (PyTorch CUDA; deploy on a GPU host)
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Extra image tag to publish alongside :latest (optional)"
-        required: false
-        default: ""
+      variant:
+        description: "Which image(s) to build"
+        type: choice
+        options: [both, gpu, cpu]
+        default: both
 
 concurrency:
   group: build-${{ github.ref }}
@@ -21,43 +23,80 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            dockerfile: Dockerfile
+            tags: |
+              type=raw,value=latest
+              type=raw,value=cpu
+          - variant: gpu
+            dockerfile: Dockerfile.gpu
+            tags: |
+              type=raw,value=gpu
     steps:
       - uses: actions/checkout@v4
 
+      # Skip a variant unless it was requested.
+      - name: Should build this variant?
+        id: gate
+        run: |
+          want='${{ github.event.inputs.variant }}'
+          if [ "$want" = "both" ] || [ "$want" = "${{ matrix.variant }}" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The GPU image (PyTorch CUDA + lmdeploy) is multi-GB — reclaim runner disk first.
+      - name: Free disk space
+        if: steps.gate.outputs.go == 'true' && matrix.variant == 'gpu'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
       - name: Set up Buildx
+        if: steps.gate.outputs.go == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.gate.outputs.go == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Image name is lowercased automatically (GHCR requires lowercase).
-      # No type=sha tag — keeps the package free of per-commit sha images.
+      # Image name is lowercased automatically (GHCR requires lowercase). No type=sha tag.
       - name: Image metadata
+        if: steps.gate.outputs.go == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
+          tags: ${{ matrix.tags }}
 
-      - name: Build and push
+      - name: Build and push (${{ matrix.variant }})
+        if: steps.gate.outputs.go == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
       - name: Summary
+        if: steps.gate.outputs.go == 'true'
         run: |
-          echo "### Pushed image" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Pushed ${{ matrix.variant }} image"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

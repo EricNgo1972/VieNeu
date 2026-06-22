@@ -178,23 +178,30 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 
 ## Build & publish the image (GitHub Actions → GHCR)
 
-A **manual** workflow (`.github/workflows/build.yml`) builds the container and pushes it to
+A **manual** workflow (`.github/workflows/build.yml`) builds the images and pushes them to
 GitHub Container Registry. It does **not** run on push — trigger it yourself:
 
-1. GitHub → **Actions** → **build-and-push** → **Run workflow** (optionally pass an extra tag).
-2. It publishes `ghcr.io/ericngo1972/vieneu:latest` (lowercased automatically).
+1. GitHub → **Actions** → **build-and-push** → **Run workflow** → pick `both`, `gpu`, or `cpu`.
+2. It publishes (image name lowercased automatically):
+   - `ghcr.io/ericngo1972/vieneu:latest` and `:cpu` — CPU image (v3 Turbo on ONNX)
+   - `ghcr.io/ericngo1972/vieneu:gpu` — **GPU image** (PyTorch CUDA; for the GPU server)
 
-Pull and run it on the host (the package is private, so log in first):
+GPU build runs on a CPU CI runner (building needs no GPU — only *running* does).
+
+**Deploy the GPU image on the GPU server** (the package is private, so log in first):
 
 ```bash
-echo "$GHCR_PAT" | docker login ghcr.io -u EricNgo1972 --password-stdin   # PAT with read:packages
-docker run -d --name vieneu-tts-shim -p 8080:8080 \
-  -v vieneu_hf:/data/hf -e VIENEU_MODE=local \
-  ghcr.io/ericngo1972/vieneu:latest
+# read:packages PAT — create at github.com/settings/tokens
+echo "$GHCR_PAT" | docker login ghcr.io -u EricNgo1972 --password-stdin
+
+docker run -d --name vieneu-tts-shim --gpus all -p 8080:8080 \
+  -v vieneu_hf:/data/hf -e VIENEU_MODE=v3turbo --restart unless-stopped \
+  ghcr.io/ericngo1972/vieneu:gpu
 ```
 
-Or pin the image in `docker-compose.yml` (replace `build: .` with
-`image: ghcr.io/ericngo1972/vieneu:latest`).
+Or pin it in `docker-compose.gpu.yml` (replace the `build:` block with
+`image: ghcr.io/ericngo1972/vieneu:gpu`) and run
+`docker compose -f docker-compose.gpu.yml up -d`. The CPU image is `…:latest` for non-GPU hosts.
 
 ## Configuration (env vars)
 

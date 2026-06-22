@@ -24,12 +24,23 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
-# Torch + torchaudio come from PyTorch's CUDA 12.8 index; vieneu[gpu] pulls
-# transformers/lmdeploy/librosa. --break-system-packages: this is a dedicated container.
-RUN python -m pip install --break-system-packages --upgrade pip \
- && python -m pip install --break-system-packages \
-      --extra-index-url https://download.pytorch.org/whl/cu128 \
-      "vieneu[gpu]==3.0.5" "fastapi>=0.110" "uvicorn[standard]>=0.27" "soundfile>=0.12.1" numpy
+# Staged install (instead of vieneu[gpu]) so the image builds reliably:
+#  1) PyTorch CUDA 12.8 wheels from the pytorch index.
+#  2) Core shim + the deps v3 Turbo (GPU) actually needs: transformers/neucodec/librosa/triton.
+#     This is enough for VIENEU_MODE=v3turbo (the tts.starb.ca default).
+#  3) lmdeploy is best-effort — it enables VIENEU_MODE=fast (v2). If its wheel is
+#     unavailable for this CUDA, the build still succeeds (v2 just won't be available).
+# (llama-cpp-python / the v1 "standard" GGUF backend is intentionally omitted — it compiles
+#  from source and isn't needed; add it yourself if you want VIENEU_MODE=standard.)
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+      torch==2.8.0 torchaudio==2.8.0
+RUN python -m pip install \
+      "vieneu==3.0.5" transformers "librosa>=0.11.0" "neucodec>=0.0.4" triton \
+      "fastapi>=0.110" "uvicorn[standard]>=0.27" "soundfile>=0.12.1" numpy
+RUN python -m pip install lmdeploy \
+ || echo "WARNING: lmdeploy not installed — VIENEU_MODE=fast (v2) will be unavailable; v3turbo works."
 
 COPY app.py .
 
