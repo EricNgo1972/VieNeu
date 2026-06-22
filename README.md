@@ -23,10 +23,18 @@ exposing a clean OpenAI surface.
 
 | Method & path           | Purpose                                                        |
 |-------------------------|----------------------------------------------------------------|
+| `GET  /`                | **Built-in test page** — load voices, synthesize, play, download |
 | `POST /v1/audio/speech` | `{model, input, voice, response_format}` → audio bytes (mp3/wav/flac/ogg) |
 | `GET  /v1/audio/voices` | Discover preset voices: `{"voices":[{"id","description"}]}`     |
 | `GET  /v1/models`       | OpenAI-style model list                                        |
-| `GET  /health`          | Liveness + mode/model/voice count                              |
+| `GET  /health`          | Liveness + mode/model/voice count (used by the Docker healthcheck) |
+
+### Test page
+
+Open `http://<shim-host>:8080/` in a browser to exercise the whole pipeline without the
+Studio app: it calls **Load voices**, lets you type Vietnamese text, synthesizes, and
+plays/downloads the result — so you can confirm the wrapper works (and audition voices)
+independently. If you set `SHIM_API_KEY`, paste it into the page's API-key field.
 
 ## Modes
 

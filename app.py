@@ -32,7 +32,7 @@ import threading
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Header, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -154,11 +154,17 @@ class SpeechRequest(BaseModel):
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
-@app.get("/")
 @app.get("/health")
 def health():
     return {"status": "ok", "mode": MODE, "model": MODEL_NAME,
             "loaded": _tts is not None, "voices": len(_voices)}
+
+
+@app.get("/", response_class=HTMLResponse)
+def test_ui():
+    """Self-contained test page: load voices, synthesize, play, download.
+    Lets you verify the full pipeline without the Studio app."""
+    return _TEST_HTML
 
 
 @app.get("/v1/models")
@@ -205,3 +211,132 @@ def speech(req: SpeechRequest, authorization: str | None = Header(default=None))
 def _http_exc(_, exc: HTTPException):  # OpenAI-style error envelope
     return JSONResponse(status_code=exc.status_code,
                         content={"error": {"message": exc.detail, "code": exc.status_code}})
+
+
+_TEST_HTML = """<!doctype html>
+<html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VieNeu-TTS shim · test</title>
+<style>
+  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1f2330; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  .muted { color: #6b7280; font-size: .85rem; }
+  label { display: block; font-weight: 600; font-size: .85rem; margin: 1rem 0 .35rem; }
+  textarea, select, input { width: 100%; box-sizing: border-box; padding: .55rem .6rem;
+    border: 1px solid #cdd2dc; border-radius: 8px; font-size: .95rem; }
+  textarea { min-height: 110px; resize: vertical; }
+  .row { display: flex; gap: .75rem; } .row > * { flex: 1; }
+  .btns { display: flex; gap: .6rem; margin-top: 1rem; align-items: center; }
+  button { padding: .55rem 1rem; border: 0; border-radius: 8px; font-weight: 600;
+    cursor: pointer; background: #3b5bdb; color: #fff; }
+  button.secondary { background: #e9ecf3; color: #1f2330; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1rem; font-size: .9rem; white-space: pre-wrap; }
+  .err { color: #c92a2a; } .ok { color: #2b8a3e; }
+  audio { width: 100%; margin-top: 1rem; }
+  .pill { display:inline-block; background:#e7f5ff; color:#1971c2; border-radius:999px;
+    padding:.1rem .5rem; font-size:.75rem; margin-left:.4rem; }
+</style></head>
+<body>
+  <h1>VieNeu-TTS shim <span id="badge" class="pill">…</span></h1>
+  <div class="muted">Self-contained test page — exercises <code>POST /v1/audio/speech</code> directly.</div>
+
+  <label>API key <span class="muted">(only if SHIM_API_KEY is set)</span></label>
+  <input id="key" type="password" placeholder="leave blank if none" autocomplete="off">
+
+  <label>Voice</label>
+  <div class="row">
+    <select id="voice"><option value="">— model default —</option></select>
+    <button class="secondary" style="flex:0 0 auto" id="loadBtn" onclick="loadVoices()">Load voices</button>
+  </div>
+
+  <label>Text</label>
+  <textarea id="text">Xin chào, đây là giọng đọc tiếng Việt được tổng hợp qua VieNeu-TTS.</textarea>
+
+  <div class="row" style="margin-top:.5rem">
+    <div><label style="margin-top:0">Format</label>
+      <select id="fmt"><option>mp3</option><option>wav</option></select></div>
+    <div></div>
+  </div>
+
+  <div class="btns">
+    <button id="goBtn" onclick="synth()">Synthesize ▶</button>
+    <a id="dl" style="display:none"></a>
+  </div>
+
+  <div id="status"></div>
+  <audio id="player" controls style="display:none"></audio>
+
+<script>
+function authHeaders(extra) {
+  const h = extra || {};
+  const k = document.getElementById('key').value.trim();
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return h;
+}
+function setStatus(msg, cls) {
+  const s = document.getElementById('status');
+  s.textContent = msg; s.className = cls || '';
+}
+async function health() {
+  try {
+    const r = await fetch('health'); const j = await r.json();
+    document.getElementById('badge').textContent =
+      j.mode + (j.loaded ? ' · loaded' : ' · not loaded') + ' · ' + j.voices + ' voices';
+  } catch { document.getElementById('badge').textContent = 'offline'; }
+}
+async function loadVoices() {
+  const btn = document.getElementById('loadBtn'); btn.disabled = true;
+  setStatus('Loading voices…');
+  try {
+    const r = await fetch('v1/audio/voices', { headers: authHeaders() });
+    if (!r.ok) throw new Error((await r.json()).error?.message || r.status);
+    const list = (await r.json()).voices || [];
+    const sel = document.getElementById('voice');
+    sel.length = 1; // keep the default option
+    for (const v of list) {
+      const o = document.createElement('option');
+      o.value = v.id; o.textContent = v.description ? (v.id + ' — ' + v.description) : v.id;
+      sel.appendChild(o);
+    }
+    setStatus('Loaded ' + list.length + ' voices.', 'ok');
+  } catch (e) { setStatus('Could not load voices: ' + e.message, 'err'); }
+  finally { btn.disabled = false; }
+}
+async function synth() {
+  const go = document.getElementById('goBtn'); go.disabled = true;
+  const player = document.getElementById('player'); player.style.display = 'none';
+  const dl = document.getElementById('dl'); dl.style.display = 'none';
+  const fmt = document.getElementById('fmt').value;
+  setStatus('Synthesizing… (first call also loads the model — can take a while)');
+  const t0 = performance.now();
+  try {
+    const r = await fetch('v1/audio/speech', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        input: document.getElementById('text').value,
+        voice: document.getElementById('voice').value,
+        response_format: fmt,
+      }),
+    });
+    if (!r.ok) {
+      let m = r.status; try { m = (await r.json()).error?.message || m; } catch {}
+      throw new Error(m);
+    }
+    const blob = await r.blob();
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const url = URL.createObjectURL(blob);
+    player.src = url; player.style.display = 'block';
+    dl.href = url; dl.download = 'tts.' + fmt; dl.textContent = '⬇ download';
+    dl.style.display = 'inline'; dl.className = 'muted';
+    setStatus('Done in ' + secs + 's · ' + Math.round(blob.size/1024) + ' KB · ' + blob.type, 'ok');
+    player.play().catch(()=>{});
+  } catch (e) { setStatus('Failed: ' + e.message, 'err'); }
+  finally { go.disabled = false; }
+}
+health();
+</script>
+</body></html>"""
+
