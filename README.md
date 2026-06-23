@@ -25,6 +25,7 @@ exposing a clean OpenAI surface.
 |-------------------------|----------------------------------------------------------------|
 | `GET  /`                | **Built-in test page** — load voices, synthesize, play, download |
 | `POST /v1/audio/speech` | `{model, input, voice, response_format}` → audio bytes (mp3/wav/flac/ogg) |
+| `POST /v1/audio/speech_srt` | Same body → **JSON** with audio (base64) **and a matching SRT** + cues |
 | `GET  /v1/audio/voices` | Discover preset voices: `{"voices":[{"id","description"}]}`     |
 | `GET  /v1/models`       | OpenAI-style model list                                        |
 | `GET  /health`          | Liveness + mode/model/voice count (used by the Docker healthcheck) |
@@ -35,6 +36,49 @@ Open `http://<shim-host>:8080/` in a browser to exercise the whole pipeline with
 Studio app: it calls **Load voices**, lets you type Vietnamese text, synthesizes, and
 plays/downloads the result — so you can confirm the wrapper works (and audition voices)
 independently. If you set `SHIM_API_KEY`, paste it into the page's API-key field.
+
+## Subtitles (SRT) — `POST /v1/audio/speech_srt`
+
+VieNeu returns **audio only** — it has no built-in word timestamps. This endpoint gets
+you a synced subtitle file anyway: it splits `input` into cues (by sentence, and by
+clause if a sentence is very long), synthesizes each cue **separately**, measures the
+real duration of every clip, and builds an SRT from those timings. So the SRT lines up
+exactly with the returned audio. Timing is **sentence-level**, not word-level.
+
+Same request body as `/v1/audio/speech` (`model`, `input`, `voice`, `response_format`).
+Response is JSON:
+
+```jsonc
+{
+  "model": "VieNeu-TTS-v3-Turbo",
+  "format": "mp3",
+  "sample_rate": 24000,
+  "duration": 4.4,                 // seconds, total
+  "audio": "<base64-encoded audio>",
+  "srt": "1\n00:00:00,000 --> 00:00:01,400\nXin chào.\n\n2\n…",
+  "cues": [                        // raw timings, if you'd rather build VTT/etc. yourself
+    {"text": "Xin chào.", "start": 0.0, "end": 1.4}
+  ]
+}
+```
+
+Example — save the MP3 and SRT side by side:
+
+```python
+import base64, requests
+
+r = requests.post("http://localhost:8080/v1/audio/speech_srt", json={
+    "input": "Xin chào. Đây là dòng thứ hai. Và dòng thứ ba.",
+    "voice": "",                   # "" = model default; or a preset id from /v1/audio/voices
+    "response_format": "mp3",
+}).json()
+
+open("speech.mp3", "wb").write(base64.b64decode(r["audio"]))
+open("speech.srt", "w", encoding="utf-8").write(r["srt"])
+```
+
+> **Note:** because it calls the model once per sentence, this is a bit slower than the
+> single-shot `/v1/audio/speech`. That per-cue synthesis is what makes the timings exact.
 
 ## Models — one per instance, chosen by `VIENEU_MODE`
 
@@ -230,6 +274,14 @@ curl -s http://localhost:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"Xin chào, đây là giọng đọc tiếng Việt.","voice":"","response_format":"mp3"}' \
   -o out.mp3 && file out.mp3
+
+# synthesize + subtitles → JSON, then split into out.mp3 + out.srt
+curl -s http://localhost:8080/v1/audio/speech_srt \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Xin chào. Đây là dòng thứ hai. Và dòng thứ ba.","voice":"","response_format":"mp3"}' \
+  | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); \
+open("out.mp3","wb").write(base64.b64decode(d["audio"])); \
+open("out.srt","w").write(d["srt"]); print("wrote out.mp3 + out.srt,", d["duration"], "s")'
 ```
 
 ## Point Maple Video Studio at it

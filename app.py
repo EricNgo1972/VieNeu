@@ -16,6 +16,15 @@ so any OpenAI-compatible client (e.g. Maple Video Studio) can synthesize over pl
 HTTP. It also exposes /v1/audio/voices and /v1/models so clients can discover the
 real Vietnamese voice list.
 
+For subtitling there is a second endpoint:
+
+    POST /v1/audio/speech_srt   {…same…} -> JSON {audio (base64), srt, cues}
+
+It synthesizes sentence-by-sentence, measures each clip, and returns the audio plus
+an SRT timeline (and raw cues) in one call. VieNeu returns audio only — no built-in
+timestamps — so timing is derived from per-segment durations (sentence-level, not
+word-level).
+
 Modes (env VIENEU_MODE)
 -----------------------
   local  (default) : runs v3 Turbo on CPU via ONNX (torch-free, self-contained,
@@ -26,6 +35,8 @@ Modes (env VIENEU_MODE)
 """
 import io
 import os
+import re
+import base64
 import logging
 import threading
 
@@ -158,6 +169,69 @@ def _encode(audio: np.ndarray, sample_rate: int, fmt: str) -> tuple[bytes, str]:
     return buf.getvalue(), ctype
 
 
+# ── Subtitle (SRT) helpers ───────────────────────────────────────────────────
+def _fmt_ts(sec: float) -> str:
+    """Seconds → SRT timestamp 'HH:MM:SS,mmm'."""
+    ms = int(round(sec * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1_000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _segment_text(text: str, max_chars: int = 200) -> list[str]:
+    """Split into subtitle-sized cues: by sentence, then by clause if still too long."""
+    raw = [s.strip() for s in re.split(r"(?<=[.!?…])\s+|\n+", text) if s.strip()]
+    segs: list[str] = []
+    for s in raw:
+        if len(s) <= max_chars:
+            segs.append(s)
+            continue
+        cur = ""
+        for part in re.split(r"(?<=[,;:])\s+", s):
+            if len(cur) + len(part) + 1 <= max_chars:
+                cur = f"{cur} {part}".strip()
+            else:
+                if cur:
+                    segs.append(cur)
+                cur = part
+        if cur:
+            segs.append(cur)
+    return segs
+
+
+def build_srt(cues: list[dict]) -> str:
+    """cues: [{'text', 'start', 'end'}, …] (seconds) → SRT document."""
+    blocks = [
+        f"{i}\n{_fmt_ts(c['start'])} --> {_fmt_ts(c['end'])}\n{c['text'].strip()}"
+        for i, c in enumerate(cues, 1)
+    ]
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def _synth_with_cues(text: str, voice_data, gap: float = 0.15):
+    """Synthesize each cue separately so SRT timings match the merged audio exactly.
+    Returns (audio float32 1-D, sample_rate, cues). Caller must hold `_lock`."""
+    sr = int(getattr(_tts, "sample_rate", 24000))
+    silence = np.zeros(int(sr * gap), dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    cues: list[dict] = []
+    t = 0.0
+    for seg in _segment_text(text):
+        a = (_tts.infer(text=seg, voice=voice_data) if voice_data is not None
+             else _tts.infer(text=seg))
+        a = np.asarray(a, dtype=np.float32).reshape(-1)
+        if a.size == 0:
+            continue
+        dur = a.size / sr
+        cues.append({"text": seg, "start": round(t, 3), "end": round(t + dur, 3)})
+        chunks.append(a)
+        chunks.append(silence)
+        t += dur + gap
+    audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+    return audio, sr, cues
+
+
 def _check_auth(authorization: str | None):
     if SHIM_API_KEY:
         token = (authorization or "").removeprefix("Bearer ").strip()
@@ -226,6 +300,46 @@ def speech(req: SpeechRequest, authorization: str | None = Header(default=None))
         raise HTTPException(status_code=500, detail="Model returned empty audio.")
     data, ctype = _encode(audio, sr, fmt)
     return Response(content=data, media_type=ctype)
+
+
+@app.post("/v1/audio/speech_srt")
+def speech_srt(req: SpeechRequest, authorization: str | None = Header(default=None)):
+    """Synthesize + return audio and a matching SRT in one JSON response.
+
+    Same request body as /v1/audio/speech. Timing is sentence-level (VieNeu has no
+    word-level timestamps): the text is split into cues, each is synthesized
+    separately, and start/end come from the real per-clip durations.
+
+    Response: {model, format, sample_rate, duration, audio (base64), srt, cues}
+    """
+    _check_auth(authorization)
+    text = (req.input or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`input` text is required.")
+    fmt = (req.response_format or "mp3").strip().lower()
+    _load()
+    try:
+        with _lock:
+            voice_data = _resolve_voice(req.voice)
+            audio, sr, cues = _synth_with_cues(text, voice_data)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.exception("Synthesis failed")
+        raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
+
+    if audio.size == 0:
+        raise HTTPException(status_code=500, detail="Model returned empty audio.")
+    data, ctype = _encode(audio, sr, fmt)
+    return JSONResponse({
+        "model": _active_model(),
+        "format": "wav" if ctype == "audio/wav" else fmt,  # reflects _encode fallback
+        "sample_rate": sr,
+        "duration": round(audio.size / sr, 3),
+        "audio": base64.b64encode(data).decode(),
+        "srt": build_srt(cues),
+        "cues": cues,
+    })
 
 
 @app.exception_handler(HTTPException)
