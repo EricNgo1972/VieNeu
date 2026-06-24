@@ -43,6 +43,13 @@ RUN python -m pip install \
 RUN python -m pip install lmdeploy \
  || echo "WARNING: lmdeploy not installed — VIENEU_MODE=fast (v2) will be unavailable; v3turbo works."
 
+# Re-pin the torch trio LAST. neucodec/transformers (via torchao/torchtune) pull torch
+# up to 2.10, but torchaudio stays at 2.8 → libtorchaudio.so is ABI-mismatched and fails
+# to load ("Could not load libtorchaudio.so"), 500ing every synthesis. Force the matching
+# CUDA 12.8 set back; nothing installed after this changes torch.
+RUN python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+      torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0
+
 COPY app.py .
 
 RUN mkdir -p /data/hf
