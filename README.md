@@ -257,6 +257,7 @@ Or pin it in `docker-compose.gpu.yml` (replace the `build:` block with
 | `VIENEU_API_BASE`     | `http://localhost:23333/v1`    | remote LMDeploy base URL (remote mode)       |
 | `VIENEU_DEFAULT_VOICE`| *(empty)*                      | preset id used when a request omits `voice`  |
 | `SHIM_API_KEY`        | *(empty)*                      | if set, requires `Authorization: Bearer <key>` |
+| `VIENEU_MAX_INPUT_CHARS`| `20000`                      | reject `input` longer than this with 413 (guards the single worker against OOM); `0` disables |
 | `HF_TOKEN`            | *(empty)*                      | only for private/gated HF models             |
 
 > **GPU note:** `local` is CPU/ONNX, torch-free, and serves only v3 Turbo. The GPU-backed

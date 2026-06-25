@@ -36,9 +36,14 @@ Modes (env VIENEU_MODE)
 import io
 import os
 import re
+import sys
+import time
 import base64
+import signal
 import logging
 import threading
+import faulthandler
+from contextlib import contextmanager
 
 import numpy as np
 import soundfile as sf
@@ -48,6 +53,32 @@ from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vieneu-shim")
+
+# ── Crash diagnostics ────────────────────────────────────────────────────────
+# The shim was crashing in production after some uptime with no log trail. These
+# hooks make the cause observable:
+#   • faulthandler dumps a C-level traceback to stderr on a native crash
+#     (SIGSEGV/SIGABRT/SIGFPE) — the ONNX/torch inference is native code that a
+#     normal Python `except` can never catch.
+#   • SIGUSR1 dumps every thread's stack on demand — if the service hangs and
+#     "did not recover", run `kill -USR1 <pid>` to see exactly where each worker
+#     thread is stuck (e.g. all blocked waiting on the synth lock).
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+except (AttributeError, ValueError):  # SIGUSR1 absent (e.g. Windows) or no console
+    pass
+
+
+def _rss_mb() -> float | None:
+    """Resident memory in MB from /proc (Linux); None where unavailable.
+    Logged per request so a steady climb → OOM-kill is visible before the crash."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return round(pages * (os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)), 1)
+    except Exception:  # noqa: BLE001
+        return None
 
 # ── Config (all via env) ────────────────────────────────────────────────────
 # VIENEU_MODE selects which model this instance serves (one model per instance).
@@ -72,6 +103,10 @@ EMOTION       = os.getenv("VIENEU_EMOTION", "natural").strip()        # natural 
 DEFAULT_VOICE = os.getenv("VIENEU_DEFAULT_VOICE", "").strip()         # optional preset id
 HF_TOKEN      = os.getenv("HF_TOKEN", "").strip() or None
 SHIM_API_KEY  = os.getenv("SHIM_API_KEY", "").strip()                 # if set, require Bearer
+# Cap request text length. A single oversized `input` could synthesize hundreds of
+# MB of audio and OOM-kill the (single-worker) container — the suspected cause of
+# the "crashes after a while, never recovers" reports. 0 disables the cap.
+MAX_INPUT_CHARS = int(os.getenv("VIENEU_MAX_INPUT_CHARS", "20000") or 0)
 
 # soundfile/libsndfile subtype per container format
 _FORMATS = {
@@ -95,6 +130,27 @@ app = FastAPI(title="VieNeu-TTS OpenAI shim", version="1.0")
 # Single model instance, guarded — `infer` is CPU-bound and not thread-safe.
 _tts = None
 _lock = threading.Lock()
+
+
+@contextmanager
+def _synth_lock(what: str):
+    """Acquire the synth lock, logging how long we waited and how long we held it.
+    The SRT endpoint holds this for a whole multi-sentence loop; if one request
+    stalls, every other synth request piles up behind it (the 'did not recover'
+    symptom). These logs make that contention — and any single slow call — visible."""
+    t0 = time.monotonic()
+    if not _lock.acquire(blocking=False):
+        log.info("%s: synth lock busy, waiting…", what)
+        _lock.acquire()
+        log.info("%s: acquired synth lock after %.2fs wait.", what, time.monotonic() - t0)
+    held0 = time.monotonic()
+    try:
+        yield
+    finally:
+        _lock.release()
+        held = time.monotonic() - held0
+        if held > 5.0:
+            log.info("%s: held synth lock for %.2fs.", what, held)
 # voice index: lower(id|description) -> canonical preset id
 _voice_index: dict[str, str] = {}
 _voices: list[tuple[str, str]] = []   # (description, id) as returned by the SDK
@@ -209,27 +265,59 @@ def build_srt(cues: list[dict]) -> str:
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def _synth_with_cues(text: str, voice_data, gap: float = 0.15):
-    """Synthesize each cue separately so SRT timings match the merged audio exactly.
-    Returns (audio float32 1-D, sample_rate, cues). Caller must hold `_lock`."""
+def _synth_cues_encoded(text: str, voice_data, fmt: str, gap: float = 0.15):
+    """Synthesize each cue and stream it straight into the output encoder, so we
+    never hold the whole track in memory at once. Previously this built a Python
+    list of every segment's float32 audio AND a full concatenated copy AND the
+    encoded bytes AND a base64 string simultaneously — ~4 copies of a track that,
+    for a long document, is hundreds of MB and OOM-kills the single worker.
+
+    Returns (encoded_bytes, content_type, sample_rate, cues, total_frames).
+    Caller must hold `_lock`."""
     sr = int(getattr(_tts, "sample_rate", 24000))
     silence = np.zeros(int(sr * gap), dtype=np.float32)
-    chunks: list[np.ndarray] = []
+    subtype, ctype = _FORMATS.get(fmt, _FORMATS["mp3"])
     cues: list[dict] = []
+    segs = _segment_text(text)
+    log.info("srt: synthesizing %d segment(s) from %d chars, fmt=%s (rss=%sMB).",
+             len(segs), len(text), subtype, _rss_mb())
+
+    def _open(sub: str):
+        buf = io.BytesIO()
+        return buf, sf.SoundFile(buf, mode="w", samplerate=sr, channels=1, format=sub)
+
+    try:
+        buf, snd = _open(subtype)
+    except Exception as e:  # noqa: BLE001 — e.g. libsndfile without MP3 → fall back to WAV
+        if subtype == "WAV":
+            raise
+        log.warning("srt: opening %s encoder failed (%s) — falling back to WAV.", subtype, e)
+        subtype, ctype = "WAV", "audio/wav"
+        buf, snd = _open(subtype)
+
     t = 0.0
-    for seg in _segment_text(text):
-        a = (_tts.infer(text=seg, voice=voice_data) if voice_data is not None
-             else _tts.infer(text=seg))
-        a = np.asarray(a, dtype=np.float32).reshape(-1)
-        if a.size == 0:
-            continue
-        dur = a.size / sr
-        cues.append({"text": seg, "start": round(t, 3), "end": round(t + dur, 3)})
-        chunks.append(a)
-        chunks.append(silence)
-        t += dur + gap
-    audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-    return audio, sr, cues
+    total = 0
+    with snd:
+        for i, seg in enumerate(segs, 1):
+            s0 = time.monotonic()
+            a = (_tts.infer(text=seg, voice=voice_data) if voice_data is not None
+                 else _tts.infer(text=seg))
+            a = np.asarray(a, dtype=np.float32).reshape(-1)
+            log.info("srt: seg %d/%d ok in %.2fs (%d chars → %.2fs audio, rss=%sMB).",
+                     i, len(segs), time.monotonic() - s0, len(seg), a.size / sr, _rss_mb())
+            if a.size == 0:
+                log.warning("srt: seg %d/%d returned empty audio — skipping.", i, len(segs))
+                continue
+            dur = a.size / sr
+            cues.append({"text": seg, "start": round(t, 3), "end": round(t + dur, 3)})
+            snd.write(a)
+            snd.write(silence)
+            t += dur + gap
+            total += a.size + silence.size
+            del a  # free the segment promptly instead of holding every chunk
+        snd.flush()
+        data = buf.getvalue()
+    return data, ctype, sr, cues, total
 
 
 def _check_auth(authorization: str | None):
@@ -237,6 +325,20 @@ def _check_auth(authorization: str | None):
         token = (authorization or "").removeprefix("Bearer ").strip()
         if token != SHIM_API_KEY:
             raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+def _require_text(req: "SpeechRequest") -> str:
+    """Validate `input`: non-empty and within MAX_INPUT_CHARS. Returning 400/413 here
+    keeps a pathological request from synthesizing until the worker OOM-kills."""
+    text = (req.input or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`input` text is required.")
+    if MAX_INPUT_CHARS and len(text) > MAX_INPUT_CHARS:
+        log.warning("Rejecting oversized input: %d chars > limit %d.", len(text), MAX_INPUT_CHARS)
+        raise HTTPException(
+            status_code=413,
+            detail=f"`input` too long ({len(text)} chars; limit {MAX_INPUT_CHARS}).")
+    return text
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -279,13 +381,13 @@ def list_voices(authorization: str | None = Header(default=None)):
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest, authorization: str | None = Header(default=None)):
     _check_auth(authorization)
-    text = (req.input or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="`input` text is required.")
+    text = _require_text(req)
     fmt = (req.response_format or "mp3").strip().lower()
+    log.info("speech: %d chars, fmt=%s, voice=%r (rss=%sMB)", len(text), fmt, req.voice, _rss_mb())
     _load()
+    t0 = time.monotonic()
     try:
-        with _lock:
+        with _synth_lock("speech"):
             voice_data = _resolve_voice(req.voice)
             audio = (_tts.infer(text=text, voice=voice_data) if voice_data is not None
                      else _tts.infer(text=text))
@@ -299,6 +401,8 @@ def speech(req: SpeechRequest, authorization: str | None = Header(default=None))
     if audio is None or len(np.asarray(audio).reshape(-1)) == 0:
         raise HTTPException(status_code=500, detail="Model returned empty audio.")
     data, ctype = _encode(audio, sr, fmt)
+    log.info("speech: done in %.2fs (%d bytes, rss=%sMB)",
+             time.monotonic() - t0, len(data), _rss_mb())
     return Response(content=data, media_type=ctype)
 
 
@@ -313,39 +417,63 @@ def speech_srt(req: SpeechRequest, authorization: str | None = Header(default=No
     Response: {model, format, sample_rate, duration, audio (base64), srt, cues}
     """
     _check_auth(authorization)
-    text = (req.input or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="`input` text is required.")
+    text = _require_text(req)
     fmt = (req.response_format or "mp3").strip().lower()
+    log.info("speech_srt: %d chars, fmt=%s, voice=%r (rss=%sMB)", len(text), fmt, req.voice, _rss_mb())
     _load()
+    t0 = time.monotonic()
     try:
-        with _lock:
+        with _synth_lock("speech_srt"):
             voice_data = _resolve_voice(req.voice)
-            audio, sr, cues = _synth_with_cues(text, voice_data)
+            data, ctype, sr, cues, frames = _synth_cues_encoded(text, voice_data, fmt)
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
         log.exception("Synthesis failed")
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
 
-    if audio.size == 0:
+    if frames == 0:
         raise HTTPException(status_code=500, detail="Model returned empty audio.")
-    data, ctype = _encode(audio, sr, fmt)
+    log.info("speech_srt: done in %.2fs (%d cues, %.2fs audio, %d bytes, rss=%sMB)",
+             time.monotonic() - t0, len(cues), frames / sr, len(data), _rss_mb())
     return JSONResponse({
         "model": _active_model(),
-        "format": "wav" if ctype == "audio/wav" else fmt,  # reflects _encode fallback
+        "format": "wav" if ctype == "audio/wav" else fmt,  # reflects encoder fallback
         "sample_rate": sr,
-        "duration": round(audio.size / sr, 3),
+        "duration": round(frames / sr, 3),
         "audio": base64.b64encode(data).decode(),
         "srt": build_srt(cues),
         "cues": cues,
     })
 
 
+@app.on_event("startup")
+def _on_startup():
+    # A line here on every boot makes container restarts (e.g. after an OOM-kill)
+    # obvious in the logs — distinguishing "crashed and restarted" from "hung".
+    log.info("Startup: pid=%s mode=%s engine=%s model=%s rss=%sMB",
+             os.getpid(), _RAW_MODE, SDK_MODE, _active_model(), _rss_mb())
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    log.info("Shutdown: pid=%s rss=%sMB", os.getpid(), _rss_mb())
+
+
 @app.exception_handler(HTTPException)
 def _http_exc(_, exc: HTTPException):  # OpenAI-style error envelope
     return JSONResponse(status_code=exc.status_code,
                         content={"error": {"message": exc.detail, "code": exc.status_code}})
+
+
+@app.exception_handler(Exception)
+def _unhandled_exc(_, exc: Exception):
+    # Anything not already turned into an HTTPException (e.g. an error in encoding
+    # or JSON building, outside the per-endpoint try) lands here with a full
+    # traceback instead of vanishing into uvicorn's default handler.
+    log.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500,
+                        content={"error": {"message": str(exc), "code": 500}})
 
 
 _TEST_HTML = """<!doctype html>
